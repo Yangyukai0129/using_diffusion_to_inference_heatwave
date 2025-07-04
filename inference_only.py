@@ -50,20 +50,43 @@ class UNet(nn.Module):
 
 # --- Inference 函數 ---
 # 推斷函數 (Algorithm 2, 15 步, 3 幀)
-def inference(model, cond, num_steps=15, device='cuda'):
+@torch.no_grad()
+def ddim_inference(model, cond, num_steps=15, device='cuda', eta=0.0):
+    """
+    DDIM deterministic reverse process (eta=0 means deterministic, eta>0 means stochastic)
+    """
     model.eval()
-    with torch.no_grad():
-        x = torch.randn(1,  24,  cond.shape[2], cond.shape[3]).to(device)
-        cond = cond.to(device)
-        print("x shape:", x.shape)
-        print("cond shape:", cond.shape)
-        for t in reversed(range(num_steps)):
-            t_tensor = torch.tensor([t / num_steps], device=device).float()
-            alpha = 1 - t_tensor
-            z = torch.randn_like(x) if t > 0 else 0
-            pred_noise = model(x, cond)
-            x = (1 / alpha.sqrt()) * (x - (1 - alpha) / ((1 - alpha).sqrt()) * pred_noise) + (1 - alpha).sqrt() * z
-        return x
+    shape = (1, 24, cond.shape[2], cond.shape[3])
+    x_t = torch.randn(shape, device=device)  # 初始化噪聲
+    cond = cond.to(device)
+
+    # 定義 beta schedule
+    beta = torch.linspace(1e-4, 0.02, num_steps).to(device)
+    alpha = 1.0 - beta
+    alpha_cumprod = torch.cumprod(alpha, dim=0)
+    sqrt_alpha_cumprod = torch.sqrt(alpha_cumprod)
+    sqrt_one_minus_alpha_cumprod = torch.sqrt(1 - alpha_cumprod)
+
+    for t in reversed(range(num_steps)):
+        t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
+
+        # 預測 noise
+        pred_noise = model(x_t, cond)
+
+        # 預測 x0
+        sqrt_alpha_t = sqrt_alpha_cumprod[t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_t = sqrt_one_minus_alpha_cumprod[t].view(-1, 1, 1, 1)
+        x0_pred = (x_t - sqrt_one_minus_alpha_t * pred_noise) / sqrt_alpha_t
+
+        if t > 0:
+            alpha_prev = alpha_cumprod[t - 1].view(-1, 1, 1, 1)
+            sigma_t = eta * torch.sqrt((1 - alpha_prev) / (1 - alpha_cumprod[t]) * (1 - alpha_cumprod[t] / alpha_prev))
+            noise = sigma_t * torch.randn_like(x_t) if eta > 0 else 0
+            x_t = torch.sqrt(alpha_prev) * x0_pred + torch.sqrt(1 - alpha_prev - sigma_t**2) * pred_noise + noise
+        else:
+            x_t = x0_pred  # 最後一步
+
+    return x_t
 
 # --- 主程式 ---
 if __name__ == "__main__":
@@ -102,7 +125,7 @@ if __name__ == "__main__":
     print(f"對應 target 時間範圍: {time_test[idx] + pd.Timedelta(hours=3 * 72)} ~ {time_test[idx] + pd.Timedelta(hours=3 * 95)}")
 
     # 模型預測
-    output = inference(model, cond_sample)
+    output = ddim_inference(model, cond_sample, num_steps=15, device=device, eta=0.0)
 
     # Ground Truth
     gt_sample = target_test[idx]  # shape: [24, H, W]
