@@ -46,7 +46,7 @@ def load_and_prepare_data(data, test_size=0.2):
     # 套用正規化
     eps = 1e-6
     cond_train = (cond_train - cond_min) / (cond_max - cond_min + eps)
-    cond_test = (cond_test - cond_min) / (cond_max - cond_min)
+    cond_test = (cond_test - cond_min) / (cond_max - cond_min + eps)
     target_train = (target_train - target_min) / (target_max - target_min)
     target_test = (target_test - target_min) / (target_max - target_min)
 
