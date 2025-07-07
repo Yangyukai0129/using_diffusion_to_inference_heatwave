@@ -78,13 +78,13 @@ def train(model, train_loader, val_loader, num_epochs, device, optimizer, criter
             t = torch.randint(0, T_steps, (target.size(0),), device=device).long()
             alpha_t = alpha_cumprod[t].view(-1, 1, 1, 1)  # broadcast to target shape
 
-            print("target shape:", target.shape)            
-            print("cond shape:", cond.shape)
+            # print("target shape:", target.shape)            
+            # print("cond shape:", cond.shape)
 
             # alpha = alpha.view(target.size(0), 1, 1, 1)  # 把 alpha 從 [batch_size] 變成 [batch_size, 1, 1, 1]
             # === 加噪 ===
             noise = torch.randn_like(target)
-            print("noise shape:", noise.shape)
+            # print("noise shape:", noise.shape)
             noisy_target = torch.sqrt(alpha_t) * target + torch.sqrt(1 - alpha_t) * noise
 
             pred_noise = model(noisy_target, cond, target_shape=target.shape)
@@ -119,7 +119,7 @@ def train(model, train_loader, val_loader, num_epochs, device, optimizer, criter
 
         print(f"[Epoch {epoch+1}/{num_epochs}] Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
-    return train_loss_history, val_loss_history
+    return train_loss_history, val_loss_history, beta, alpha, alpha_cumprod
 
 # 主程序
 if __name__ == "__main__":
@@ -148,7 +148,7 @@ if __name__ == "__main__":
    
     # === 初始訓練階段 ===
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    train_loss_history, val_loss_history = train(
+    train_loss_history, val_loss_history, beta, alpha, alpha_cumprod = train(
         model, train_loader, test_loader, num_epochs=40, device=device,
         optimizer=optimizer, criterion=criterion,
         train_loss_history=train_loss_history,
@@ -157,7 +157,7 @@ if __name__ == "__main__":
 
     # === fine-tuning 階段（繼續接上去） ===
     optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-6)
-    train_loss_history, val_loss_history = train(
+    train_loss_history, val_loss_history, beta, alpha, alpha_cumprod = train(
         model, train_loader, test_loader, num_epochs=10, device=device,
         optimizer=optimizer, criterion=criterion,
         train_loss_history=train_loss_history,
@@ -165,7 +165,13 @@ if __name__ == "__main__":
     ) 
     
     # 儲存模型
-    torch.save(model.state_dict(), "./saved_models/diffusion_model.pth")
+    torch.save({
+    "model_state_dict": model.state_dict(),
+    "beta": beta.cpu(),                   # 儲存 beta
+    "alpha": alpha.cpu(),                 # 儲存 alpha
+    "alpha_cumprod": alpha_cumprod.cpu(), # 儲存 alpha_cumprod
+    "optimizer_state_dict": optimizer.state_dict(), # 可選：儲存 optimizer
+    }, "./saved_models/diffusion_model.pth")
     print("模型已儲存完成")
 
     import os
