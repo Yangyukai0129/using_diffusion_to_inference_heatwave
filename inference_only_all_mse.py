@@ -93,8 +93,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 載入模型
-    model = UNet(in_channels=24, out_channels=24, cond_channels=72).to(device)
-    checkpoint = torch.load("./saved_models/diffusion_model.pth", map_location=device)
+    checkpoint = torch.load("./saved_models/diffusion_model_mul.pth", map_location=device)
     model = UNet(in_channels=24, out_channels=24, cond_channels=72).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])  # 載入模型參數
     beta = checkpoint["beta"].to(device)                  # 載入訓練時的 beta
