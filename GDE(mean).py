@@ -165,23 +165,20 @@ if __name__ == "__main__":
     N = 15  # Sampling 次數
     all_samples = []
     print(f"開始生成，每筆資料生成 {N} 次...")
-    for i in range(N):
-        print(f"Sampling {i+1}/{N}")
-        # 如果是生成全部測試集把cond_subset改成cond_test
-        generated_i = ddim_inference(model, cond_test, beta, device=device, eta=0.0)
+    for i in tqdm(range(N), desc="Sampling", unit="sample"):
+        generated_i = ddim_inference(model, cond_subset, beta, device=device, eta=0.0)
         all_samples.append(generated_i.detach())
 
         # 單次 MSE
-        # 如果是生成全部測試集把target_subset改成target_test
-        d1, d2, d3, all_mse = compute_daywise_mse(generated_i, target_test)
-        print(f"Sampling {i+1} MSE ➝ Day1: {d1:.6f}, Day2: {d2:.6f}, Day3: {d3:.6f}, All: {all_mse:.6f}")
+        d1, d2, d3, all_mse = compute_daywise_mse(generated_i, target_subset)
+        tqdm.write(f"Sampling {i+1} MSE ➝ Day1: {d1:.6f}, Day2: {d2:.6f}, Day3: {d3:.6f}, All: {all_mse:.6f}")
 
     all_samples = torch.stack(all_samples)  # shape: [N, batch, 24, H, W]
     gde_mean = all_samples.mean(dim=0)
 
     # GDE-mean MSE
     # 如果是生成全部測試集把target_subset改成target_test
-    d1, d2, d3, all_mse = compute_daywise_mse(gde_mean, target_test, device=device)
+    d1, d2, d3, all_mse = compute_daywise_mse(gde_mean, target_subset, device=device)
     print(f"\nGDE-mean MSE ➝ Day1: {d1:.6f}, Day2: {d2:.6f}, Day3: {d3:.6f}, All: {all_mse:.6f}")
 
     # 儲存結果
