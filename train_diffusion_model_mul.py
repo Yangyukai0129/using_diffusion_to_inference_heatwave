@@ -2,17 +2,41 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import math
+
+def sinusoidal_embedding(t, dim, device):
+    """
+    生成正弦嵌入表示
+    t: [batch_size]，時間步長
+    dim: 嵌入維度（例如 32）
+    返回: [batch_size, dim] 的嵌入張量
+    """
+    half_dim = dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+    emb = t[:, None].float() * emb[None, :]  # [batch_size, half_dim]
+    emb = torch.cat((emb.sin(), emb.cos()), dim=-1)  # [batch_size, dim]
+    return emb
 
 # U-Net 模型 (與圖 6 對應)
 class UNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=9, cond_channels=12):
+    def __init__(self, in_channels=3, out_channels=9, cond_channels=12, time_dim=32):
         super(UNet, self).__init__()
-        self.down1 = nn.Conv2d(in_channels + cond_channels, 64, 3, padding=1)
+        self.time_dim = time_dim
+        # 時間嵌入層
+        self.time_embed = nn.Sequential(
+            nn.Linear(time_dim, 64),  # 從 time_dim 映射到 64 維
+            nn.SiLU(),               # 激活函數
+            nn.Linear(64, 64)        # 再次映射
+        )
+        # 下採樣層
+        self.down1 = nn.Conv2d(in_channels + cond_channels + 64, 64, 3, padding=1)  # 增加時間嵌入通道
         self.down2 = nn.Conv2d(64, 128, 3, padding=1)
         self.down3 = nn.Conv2d(128, 256, 3, padding=1)
         self.down4 = nn.Conv2d(256, 384, 3, padding=1)
         self.pool = nn.AvgPool2d(2, 2)
         self.res = nn.Sequential(nn.Conv2d(384, 384, 3, padding=1), nn.ReLU(), nn.Conv2d(384, 384, 3, padding=1))
+        # 上採樣層
         self.up1 = nn.ConvTranspose2d(384, 256, 2, stride=2)
         self.up2 = nn.ConvTranspose2d(512, 128, 2, stride=2)
         self.up3 = nn.ConvTranspose2d(256, 64, 2, stride=2)
@@ -23,9 +47,18 @@ class UNet(nn.Module):
         target_h, target_w = target_tensor.shape[2], target_tensor.shape[3]
         return F.interpolate(source_tensor, size=(target_h, target_w), mode='bilinear', align_corners=False)
 
-    def forward(self, x, cond, target_shape=None):
+    def forward(self, x, cond, t):
+        # 生成時間嵌入
+        t_emb = sinusoidal_embedding(t, self.time_dim, x.device)  # [batch_size, time_dim]
+        t_emb = self.time_embed(t_emb)  # [batch_size, 64]
+        t_emb = t_emb.unsqueeze(-1).unsqueeze(-1)  # [batch_size, 64, 1, 1]
+        t_emb = t_emb.expand(-1, -1, x.size(2), x.size(3))  # [batch_size, 64, H, W]
+
+        # 與輸入和條件拼接
+        x = torch.cat([x, cond, t_emb], dim=1)  # [batch_size, in_channels + cond_channels + 64, H, W]
+
         # Down path
-        d1 = self.down1(torch.cat([x, cond], dim=1))
+        d1 = self.down1(x)
         p1 = self.pool(d1)
         d2 = self.down2(p1)
         p2 = self.pool(d2)
@@ -51,8 +84,8 @@ class UNet(nn.Module):
         output = self.up4(u3)
 
         # 補齊 or 裁剪，確保與 target 尺寸一致
-        if target_shape is not None:
-            _, _, H, W = target_shape
+        if hasattr(self, 'target_shape') and self.target_shape is not None:
+            _, _, H, W = self.target_shape
             if output.shape[2:] != (H, W):
                 output = F.interpolate(output, size=(H, W), mode='bilinear', align_corners=False)
 
@@ -76,21 +109,15 @@ def train(model, train_loader, val_loader, num_epochs, device, optimizer, criter
             cond, target = cond.to(device), target.to(device)
             # === 取離散時間步 t ===
             t = torch.randint(0, T_steps, (target.size(0),), device=device).long()
-            alpha_t = alpha_cumprod[t].view(-1, 1, 1, 1)  # broadcast to target shape
 
-            # print("target shape:", target.shape)            
-            # print("cond shape:", cond.shape)
-
-            # alpha = alpha.view(target.size(0), 1, 1, 1)  # 把 alpha 從 [batch_size] 變成 [batch_size, 1, 1, 1]
             # === 加噪 ===
             noise = torch.randn_like(target)
             # print("noise shape:", noise.shape)
-            noisy_target = torch.sqrt(alpha_t) * target + torch.sqrt(1 - alpha_t) * noise
+            noisy_target = torch.sqrt(alpha_cumprod[t]).view(-1, 1, 1, 1) * target + \
+                           torch.sqrt(1 - alpha_cumprod[t]).view(-1, 1, 1, 1) * noise
 
-            pred_noise = model(noisy_target, cond, target_shape=target.shape)
+            pred_noise = model(noisy_target, cond, t)
             loss = criterion(pred_noise, noise)
-
-
 
             optimizer.zero_grad()
             loss.backward()
@@ -105,12 +132,12 @@ def train(model, train_loader, val_loader, num_epochs, device, optimizer, criter
             for cond, target in val_loader:
                 cond, target = cond.to(device), target.to(device)
                 t = torch.randint(0, T_steps, (target.size(0),), device=device).long()
-                alpha_t = alpha_cumprod[t].view(-1, 1, 1, 1)
 
                 noise = torch.randn_like(target)
-                noisy_target = torch.sqrt(alpha_t) * target + torch.sqrt(1 - alpha_t) * noise
+                noisy_target = torch.sqrt(alpha_cumprod[t]).view(-1, 1, 1, 1) * target + \
+                               torch.sqrt(1 - alpha_cumprod[t]).view(-1, 1, 1, 1) * noise
 
-                pred_noise = model(noisy_target, cond, target_shape=target.shape)
+                pred_noise = model(noisy_target, cond, t)
                 loss = criterion(pred_noise, noise)
                 val_loss += loss.item() * cond.size(0)
 
@@ -128,7 +155,7 @@ if __name__ == "__main__":
 
     # 模型與裝置
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNet(in_channels=24, out_channels=24, cond_channels=120).to(device)
+    model = UNet(in_channels=24, out_channels=24, cond_channels=120, time_dim=32).to(device)
 
     from data_utils_mul import WeatherDataset, load_and_prepare_data
     from torch.utils.data import DataLoader
@@ -167,14 +194,14 @@ if __name__ == "__main__":
     ) 
     
     # 儲存模型
-    torch.save({
-    "model_state_dict": model.state_dict(),
-    "beta": beta.cpu(),                   # 儲存 beta
-    "alpha": alpha.cpu(),                 # 儲存 alpha
-    "alpha_cumprod": alpha_cumprod.cpu(), # 儲存 alpha_cumprod
-    "optimizer_state_dict": optimizer.state_dict(), # 可選：儲存 optimizer
-    }, "./saved_models/diffusion_model_mul(wind).pth")
-    print("模型已儲存完成")
+    # torch.save({
+    # "model_state_dict": model.state_dict(),
+    # "beta": beta.cpu(),                   # 儲存 beta
+    # "alpha": alpha.cpu(),                 # 儲存 alpha
+    # "alpha_cumprod": alpha_cumprod.cpu(), # 儲存 alpha_cumprod
+    # "optimizer_state_dict": optimizer.state_dict(), # 可選：儲存 optimizer
+    # }, "./saved_models/diffusion_model_mul(wind).pth")
+    # print("模型已儲存完成")
 
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
