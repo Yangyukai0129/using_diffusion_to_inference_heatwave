@@ -1,68 +1,89 @@
 # data_utils.py
 import torch
 from torch.utils.data import Dataset
+import numpy as np
+import os
 
-class WeatherDataset(Dataset):
-    def __init__(self, cond_data, target_data, cond_min=None, cond_max=None, target_min=None, target_max=None):
-        self.cond_data = cond_data
-        self.target_data = target_data
-
-        # Normalization stats
-        self.cond_min = cond_min
-        self.cond_max = cond_max
-        self.target_min = target_min
-        self.target_max = target_max
+class LazyWeatherDataset(Dataset):
+    def __init__(self, file_list, cond_mean=None, cond_std=None, target_mean=None, target_std=None):
+        """
+        file_list: [(cond_path, target_path), ...]
+        mean/std: 事先算好的統計數值 (float 或 tensor)
+        """
+        self.file_list = file_list
+        self.cond_mean = cond_mean
+        self.cond_std = cond_std
+        self.target_mean = target_mean
+        self.target_std = target_std
         self.eps = 1e-6
 
     def __len__(self):
-        return len(self.cond_data)
+        return len(self.file_list)
 
     def __getitem__(self, idx):
-        cond = self.cond_data[idx]
-        target = self.target_data[idx]
+        cond_path, target_path, time_path = self.file_list[idx]
+        cond = np.load(cond_path, mmap_mode="r")  # 不會一次載入整個檔案
+        target = np.load(target_path, mmap_mode="r")
+        valid_time = np.load(time_path)  # datetime64
 
-        if self.cond_min is not None:
-            cond = (cond - self.cond_min) / (self.cond_max - self.cond_min + self.eps)
-        if self.target_min is not None:
-            target = (target - self.target_min) / (self.target_max - self.target_min)
+        cond = torch.from_numpy(cond.copy()).float()
+        target = torch.from_numpy(target.copy()).float()
 
-        return cond, target
+        # 即時標準化
+        if self.cond_mean is not None:
+            cond = (cond - self.cond_mean) / (self.cond_std + self.eps)
+        if self.target_mean is not None:
+            target = (target - self.target_mean) / (self.target_std + self.eps)
 
-def load_and_prepare_data(data, test_size=0.2):
-    cond_tensor = data["cond"]
-    target_tensor = data["target"]
-    valid_time_array = data["valid_time"]
+        # 轉成 int timestamp（秒）
+        time_int = int(valid_time.astype('datetime64[s]').astype(int))
 
-    # 過濾
-    nonzero_ratio = (target_tensor != 0).float().mean(dim=(1, 2, 3))
-    valid_idx = nonzero_ratio > 0.5
-    cond_tensor = cond_tensor[valid_idx]
-    target_tensor = target_tensor[valid_idx]
-    valid_time_array = valid_time_array[valid_idx.numpy()]
+        return cond, target, time_int
 
-    # 切分
-    N = len(cond_tensor)
-    split_index = int(N * (1 - test_size))
 
-    cond_train = cond_tensor[:split_index]
-    cond_test = cond_tensor[split_index:]
-    target_train = target_tensor[:split_index]
-    target_test = target_tensor[split_index:]
-    time_train = valid_time_array[:split_index]
-    time_test = valid_time_array[split_index:]
+def prepare_file_list(data_dir, split_ratio=0.8):
+    """把資料夾內 cond / target 檔案配對，切成 train/test"""
+    cond_files = sorted([os.path.join(data_dir, "cond", f) for f in os.listdir(os.path.join(data_dir, "cond"))])
+    target_files = sorted([os.path.join(data_dir, "target", f) for f in os.listdir(os.path.join(data_dir, "target"))])
+    time_files = sorted([os.path.join(data_dir, "time", f) for f in os.listdir(os.path.join(data_dir, "time"))])
 
-    # 正規化參數
-    cond_min = cond_train.min()
-    cond_max = cond_train.max()
-    target_min = target_train.min()
-    target_max = target_train.max()
+    N = len(cond_files)
+    split_index = int(N * split_ratio)
 
-    return cond_train, cond_test, target_train, target_test, cond_min, cond_max, target_min, target_max, time_train, time_test
+    train_files = list(zip(cond_files[:split_index], target_files[:split_index], time_files[:split_index]))
+    test_files = list(zip(cond_files[split_index:], target_files[split_index:], time_files[split_index:]))
 
-def denormalize(data, data_min, data_max, eps=1e-6):
+    return train_files, test_files
+
+
+def compute_mean_std(file_list, sample_size=1000):
+    """隨機取部分樣本計算 mean/std（避免讀全部）"""
+    idxs = np.random.choice(len(file_list), size=min(sample_size, len(file_list)), replace=False)
+    cond_vals = []
+    target_vals = []
+
+    for idx in idxs:
+        cond_path, target_path, time_path = file_list[idx]
+        cond = np.load(cond_path, mmap_mode="r")
+        target = np.load(target_path, mmap_mode="r")
+        cond_vals.append(cond)
+        target_vals.append(target)
+
+    cond_vals = np.concatenate([x.flatten() for x in cond_vals])
+    target_vals = np.concatenate([x.flatten() for x in target_vals])
+
+    return cond_vals.mean(), cond_vals.std(), target_vals.mean(), target_vals.std()
+
+def denormalize(tensor, mean, std, eps=1e-6):
     """
-    將 min-max normalized 資料還原回原始範圍
-    data: Tensor，已標準化 (0~1)
-    data_min, data_max: Tensor 或 float，原始資料的最小/最大值
+    把標準化後的 tensor 還原
+    tensor: torch.Tensor (標準化過的)
+    mean, std: float 或 torch.Tensor
     """
-    return data * (data_max - data_min + eps) + data_min
+    if isinstance(mean, torch.Tensor):
+        mean = mean.to(tensor.device)
+    if isinstance(std, torch.Tensor):
+        std = std.to(tensor.device)
+
+    return tensor * (std + eps) + mean
+
