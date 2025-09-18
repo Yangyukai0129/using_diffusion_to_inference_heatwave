@@ -72,12 +72,32 @@ class UpBlock(nn.Module):
         self.res1 = ResidualBlock(in_channels + skip1_channels, out_channels)
         self.res2 = ResidualBlock(out_channels + skip2_channels, out_channels)
 
+    # def forward(self, x, skip1, skip2):
+    #     x = self.upsample(x)
+    #     x = torch.cat([skip1, x], dim=1)
+    #     x = self.res1(x)
+    #     x = torch.cat([skip2, x], dim=1)
+    #     x = self.res2(x)
+    #     return x
+
     def forward(self, x, skip1, skip2):
         x = self.upsample(x)
+
+        # 保證上採樣後與 skip1 對齊
+        if x.shape[2:] != skip1.shape[2:]:
+            x = F.interpolate(x, size=skip1.shape[2:], mode='bilinear', align_corners=False)
+
         x = torch.cat([skip1, x], dim=1)
+
         x = self.res1(x)
+
+        # 保證與 skip2 對齊
+        if x.shape[2:] != skip2.shape[2:]:
+            x = F.interpolate(x, size=skip2.shape[2:], mode='bilinear', align_corners=False)
+
         x = torch.cat([skip2, x], dim=1)
         x = self.res2(x)
+
         return x
     
 class SkipConnection(nn.Module):
@@ -223,16 +243,19 @@ def train(model, train_loader, num_epochs, device,
             cond = cond.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
+            # ====== 關鍵步驟：展平成 (B, T*V, H, W) ======
+            B, T_c, V_c, H, W = cond.shape
+            cond = cond.view(B, T_c * V_c, H, W)
+
+            B, T_t, V_t, H, W = target.shape
+            target = target.view(B, T_t * V_t, H, W)
+
             batch_size = cond.shape[0]
             t = torch.randint(0, 1000, (batch_size,), device=device)
 
             noise = torch.randn_like(target)
             sqrt_alpha_cumprod_t = torch.sqrt(alpha_cumprod[t])[:, None, None, None]
             sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod[t])[:, None, None, None]
-            print(f"target shape: {target.shape}")
-            print(f"noise shape: {noise.shape}")
-            print(f"sqrt_alpha_cumprod_t shape: {sqrt_alpha_cumprod_t.shape}")
-            print(f"sqrt_one_minus_alpha_cumprod_t shape: {sqrt_one_minus_alpha_cumprod_t.shape}")
             x_t = sqrt_alpha_cumprod_t * target + sqrt_one_minus_alpha_cumprod_t * noise
 
             optimizer.zero_grad(set_to_none=True)
@@ -266,6 +289,10 @@ def ddim_inference(model, cond, beta, device, eta=0.0, num_steps=15):
     alpha = 1.0 - beta
     alpha_cumprod = torch.cumprod(alpha, dim=0).to(device)
 
+    # ====== 關鍵步驟：展平成 (B, T*V, H, W) ======
+    B, T_c, V_c, H, W = cond.shape
+    cond = cond.view(B, T_c * V_c, H, W)
+
     # 初始化噪聲
     shape = (cond.shape[0], model.out_channels, cond.shape[2], cond.shape[3])
     x_t = torch.randn(shape, device=device)
@@ -296,4 +323,3 @@ def ddim_inference(model, cond, beta, device, eta=0.0, num_steps=15):
             x_t = x0_pred  # 最後一步
 
     return x_t
-
